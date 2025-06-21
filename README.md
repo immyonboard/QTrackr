@@ -13,7 +13,7 @@ The bot is supposed to pull the Translink SEQ GTFS data and present it in a neat
 # Future Features (hopefully): 🤞
 - Ability to pin your stop to the top of command suggestions
 - In-Discord settings panel.
-- Ability to pull route timetables
+- Ability to pull route timetables (Somewhat implemented.)
 - Simulating PIDS
 
 Thanks and I appreciate any contributions.
