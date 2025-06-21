@@ -11,13 +11,12 @@ from google.transit import gtfs_realtime_pb2
 # Colours
 Keep = "\033[0;"
 
-
 ansi_colours = {
     "30": (0, 0, 0),        # gray/black
-    "31": (255, 0, 0),      # red
+    "31": (155, 0, 0),      # red
     "32": (0, 255, 0),      # green
     "33": (255, 255, 0),    # yellow/gold
-    "34": (0, 0, 255),      # blue
+    "34": (0, 0, 155),      # blue
     "35": (255, 0, 255),    # purple
     "36": (0, 255, 255),    # cyan
     "37": (255, 255, 255),  # white
@@ -178,10 +177,11 @@ async def view(interaction: discord.Interaction, stop_name: str):
     for svc in next_five:
         ansi_code = closest_ansi_color(svc.get("route_color", "000000"))
         print(f"Using ANSI code: {ansi_code}{svc.get("route_color", "000000")} for route {svc['route_num']}")
-        colored_dest = f"{route_num} \x1b[{ansi_code}m{svc['destination'][:34]:<35}\x1b[0m"
+        colored_dest = f"{svc['route_num']} \x1b[{ansi_code}m{svc['destination'][:34]:<35}\x1b[0m"
         time_str = f"{str(svc['minutes']) + ' min':>6}"
         rows.append(f"{colored_dest}{time_str}")
     
+    # Embed
     embed.description = f"```ansi\n{header}\n" + "\n".join(rows) + "\n```"
     embed.set_footer(text="💡 For now, only Real Time information is being shown. Services with RTT off will not be shown.")
 
