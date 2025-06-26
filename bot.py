@@ -10,6 +10,19 @@ from google.transit import gtfs_realtime_pb2
 from discord.ui import View, Button
 import asyncio
 
+
+## SETUP
+
+# 1. Ensure GTFS Static is downloaded and in the directory with the name "gtfs_static"
+
+# 2. Ensure you have a .env file with your Discord bot token
+
+# 3. Install required packages:
+# pip install discord.py aiohttp pandas google-transit
+
+# 4. Create a users folder
+
+
 # Colours
 Keep = "\033[0;"
 
