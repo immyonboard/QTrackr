@@ -82,13 +82,27 @@ def resolve_stop_input(user_input: str):
 
     return None, None
 
-
 async def stop_autocomplete(interaction: discord.Interaction, current: str):
-    results = [name for name in stop_names if current.lower() in name.lower()]
-    return [
-        app_commands.Choice(name=name, value=name)
-        for name in results[:25]
-    ]
+    user_id = str(interaction.user.id)
+    filepath = os.path.join("users", f"{user_id}_pins.txt")
+    pinned_names = []
+
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            pinned_ids = [line.strip() for line in f if line.strip()]
+            for pid in pinned_ids:
+                match = stops[stops["stop_id"] == pid]
+                if not match.empty:
+                    pinned_names.append("⭐ " + match.iloc[0]["stop_name"])
+
+    results = [name for name in stop_names if current.lower() in name.lower() and name not in [n.replace("⭐ ", "") for n in pinned_names]]
+    combined = pinned_names + results
+    combined = combined[:25]
+
+    await interaction.response.autocomplete([
+        app_commands.Choice(name=name, value=name.replace("⭐ ", ""))
+        for name in combined
+    ])
 
 # RESYNC
 @bot.event
@@ -104,6 +118,173 @@ async def on_ready():
 @bot.tree.command(name="ping", description="check if the bot is alive")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("👋 Hey! You've caught me online. Try the /view command. <:HeavyRail:1385977140448858225>", ephemeral=False)
+
+# Pin System
+
+@bot.tree.command(name="pin", description="Pin your favourite stops.")
+@app_commands.describe(stop_id="Requires numerical stop ID")
+@app_commands.autocomplete(stop_id=stop_autocomplete)
+async def pin(interaction: discord.Interaction, stop_id: str):
+    await interaction.response.defer(ephemeral=True)
+    
+    user_id = str(interaction.user.id)
+    user_dir = "users"
+    os.makedirs(user_dir, exist_ok=True)
+    filepath = os.path.join(user_dir, f"{user_id}_pins.txt")
+    
+    try:
+        with open(filepath, "a") as f:
+            f.write(stop_id + "\n")
+        await interaction.followup.send(f"📌 Stop `{stop_id}` pinned!", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Failed to pin stop: `{e}`", ephemeral=True)
+
+class ViewRefreshView(View):
+    def __init__(self, stop_id, stop_real_name):
+        super().__init__(timeout=60)
+        self.stop_id = stop_id
+        self.stop_real_name = stop_real_name
+
+    @discord.ui.button(label="🔄 Refresh", style=discord.ButtonStyle.primary)
+    async def refresh_button(self, interaction_button: discord.Interaction, button: discord.ui.Button):
+        if interaction_button.response.is_done():
+            await interaction_button.followup.send("❌ This interaction has expired. Please run /view again.", ephemeral=True)
+            return
+        else:
+            await interaction_button.response.defer()
+
+        url = "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates"
+        feed = gtfs_realtime_pb2.FeedMessage()
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    data = await resp.read()
+                    feed.ParseFromString(data)
+        except Exception as e:
+            await interaction_button.followup.send(f"⚠️ error fetching live data:\n`{e}`", ephemeral=True)
+            return
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        upcoming = []
+
+        for entity in feed.entity:
+            if entity.HasField('trip_update'):
+                trip = entity.trip_update
+                trip_id = trip.trip.trip_id
+                route_id = trip.trip.route_id
+
+                for stu in trip.stop_time_update:
+                    if stu.stop_id == self.stop_id:
+                        arrival_ts = stu.arrival.time if stu.HasField("arrival") else stu.departure.time
+                        if not arrival_ts or arrival_ts < now_ts:
+                            continue
+
+                        minutes = (arrival_ts - now_ts) // 60
+                        route_info = route_lookup.get(route_id, {})
+                        route_num = route_info.get("route_short_name", route_id)
+                        route_name = route_info.get("route_long_name", "Unknown route")
+                        route_color = route_info.get("route_color", "00FF00")
+                        destination = trip_lookup.get(trip_id, "Unknown destination")
+
+                        upcoming.append({
+                            "route_num": route_num,
+                            "route_name": route_name,
+                            "route_color": route_color,
+                            "destination": destination,
+                            "minutes": minutes
+                        })
+
+        upcoming.sort(key=lambda x: x["minutes"])
+        next_five = upcoming[:8]
+
+        if not next_five:
+            embed = discord.Embed(
+                title=f"No upcoming departures found for {self.stop_real_name}",
+                color=discord.Color.red()
+            )
+            embed.set_footer(text="💡 At this time, only Real Time information is being shown. Services lacking Real Time Transit will not be shown.")
+            await interaction_button.edit_original_response(embed=embed, view=self)
+            return
+
+        embed = discord.Embed(
+            title=f"Next departures at {self.stop_real_name}",
+            color=discord.Color.blue()
+        )
+        header = f"ID   {'Route':<37}Time"
+        rows = []
+        for svc in next_five:
+            ansi_code = closest_ansi_color(svc.get("route_color", "000000"))
+            colored_dest = f"{svc['route_num']} \x1b[{ansi_code}m{svc['destination'][:34]:<35}\x1b[0m"
+            time_str = f"{str(svc['minutes']) + ' min':>6}"
+            rows.append(f"{colored_dest}{time_str}")
+        embed.description = f"```ansi\n{header}\n" + "\n".join(rows) + "\n```"
+        embed.set_footer(text="💡 For now, only Real Time information is being shown. Services with RTT off will not be shown.")
+        await interaction_button.edit_original_response(embed=embed, view=self)
+
+@bot.tree.command(name="offlineview", description="Show next 8 scheduled services for a Translink stop (no real-time)")
+@app_commands.describe(stop_name="Stop name or stop ID")
+@app_commands.autocomplete(stop_name=stop_autocomplete)
+async def offlineview(interaction: discord.Interaction, stop_name: str):
+    stop_id, stop_real_name = resolve_stop_input(stop_name)
+    if not stop_id:
+        await interaction.response.send_message(f"❌ couldn't find stop `{stop_name}`", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    now = datetime.now()
+    today_trips = stop_times[stop_times["stop_id"] == stop_id].copy()
+
+    def parse_arrival(time_str):
+        try:
+            h, m, s = map(int, time_str.split(":"))
+            base = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            delta = timedelta(hours=h, minutes=m, seconds=s)
+            return base + delta
+        except:
+            return None
+
+    today_trips["arrival_dt"] = today_trips["arrival_time"].apply(parse_arrival)
+    print(f"✅ {len(today_trips)} trip entries after parsing")
+    print(today_trips[["trip_id", "arrival_time", "arrival_dt"]].head(10))
+    today_trips = today_trips[today_trips["arrival_dt"].notnull()]
+    today_trips = today_trips[today_trips["arrival_dt"] >= now]
+    merged = today_trips.merge(trips, on="trip_id")
+    print(f"🔗 Merged trips: {len(merged)}")
+    merged.sort_values("arrival_dt", inplace=True)
+
+    upcoming = []
+    for _, row in merged.head(8).iterrows():
+        trip_id = row["trip_id"]
+        route_id = row["route_id"]
+        minutes = int((row["arrival_dt"] - now).total_seconds() // 60)
+        route_info = route_lookup.get(route_id, {})
+        route_num = route_info.get("route_short_name", route_id)
+        destination = trip_lookup.get(trip_id, "Unknown destination")
+        color = route_info.get("route_color", "000000")
+
+        upcoming.append({
+            "route_num": route_num,
+            "destination": destination,
+            "route_color": color,
+            "minutes": minutes
+        })
+
+    embed = discord.Embed(
+        title=f"Next scheduled departures at {stop_real_name}",
+        color=discord.Color.teal()
+    )
+
+    header = f"{'Service':<37}Time"
+    rows = []
+    for svc in upcoming:
+        ansi_code = closest_ansi_color(svc.get("route_color", "000000"))
+        dest = f"\x1b[{ansi_code}m{svc['destination'][:34]:<35}\x1b[0m"
+        rows.append(f"{svc['route_num']} {dest}{svc['minutes']:>6} min")
+
+    embed.description = f"```ansi\n{header}\n" + "\n".join(rows) + "\n```"
+    embed.set_footer(text="🕓 This list uses only scheduled (static) data.")
+    await interaction.followup.send(embed=embed)
 
 @bot.tree.command(name="view", description="Show next 5 services for a Translink stop")
 @app_commands.describe(stop_name="Stop name or stop ID")
@@ -166,7 +347,7 @@ async def view(interaction: discord.Interaction, stop_name: str):
             color=discord.Color.red()
         )
         embed.set_footer(text="💡 At this time, only Real Time information is being shown. Services lacking Real Time Transit will not be shown.")
-        await interaction.followup.send(embed=embed)
+        await interaction.followup.send(embed=embed, view=ViewRefreshView(stop_id, stop_real_name))
         return
 
     embed = discord.Embed(
@@ -188,8 +369,7 @@ async def view(interaction: discord.Interaction, stop_name: str):
     embed.description = f"```ansi\n{header}\n" + "\n".join(rows) + "\n```"
     embed.set_footer(text="💡 For now, only Real Time information is being shown. Services with RTT off will not be shown.")
 
-
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, view=ViewRefreshView(stop_id, stop_real_name))
 
 @bot.tree.command(name="timetable", description="View static timetable for a route at a specific time")
 @app_commands.describe(route_id="Route short name (e.g. 100)", time="Time in 24h format like 15:30", direction="Trip direction (Inbound or Outbound)")
@@ -355,10 +535,11 @@ async def timetable(interaction: discord.Interaction, route_id: str, time: str =
             if len(stop_name) > 40:
                 stop_name = stop_name[:37] + "..."
             formatted_time = row['arrival_time'][:5]
+            ansi_code = closest_ansi_color(route_color)
             if "platform" in stop_name.lower():
-                stop_fmt = f"\x1b[1;35m{stop_name}\x1b[0m"  # italic + blue
+                stop_fmt = f"\x1b[1;{ansi_code}m{stop_name}\x1b[0m"  # bold + route color
             else:
-                stop_fmt = f"\x1b[3;35m{stop_name}\x1b[0m"  # italic + pink
+                stop_fmt = f"\x1b[3;{ansi_code}m{stop_name}\x1b[0m"  # italic + route color
             services.append(f"\x1b[1m{formatted_time}\x1b[0m — {stop_fmt}")
         first_stop_id = trip_stops.iloc[0]["stop_id"]
         stop_match = stops[stops["stop_id"].astype(str).str.strip() == str(first_stop_id).strip()]
