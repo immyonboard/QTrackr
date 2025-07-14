@@ -2,3 +2,4 @@
 SEQ_GTFS
 .DS_Store
 users
+__pycache__
