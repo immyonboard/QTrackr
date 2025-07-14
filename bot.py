@@ -63,7 +63,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise ValueError("Missing token!")
 
-gtfs_path = "gtfs_static" # Will need a way to automatically update this.
+gtfs_path = "SEQ_GTFS" # Will need a way to automatically update this.
 if gtfs_path is None or not os.path.exists(gtfs_path):
     raise ValueError("GTFS static data path is not set or does not exist! Please download the latest GTFS static data from TransLink and set the path correctly. https://translink.com.au/about-translink/open-data")
 routes = pd.read_csv(os.path.join(gtfs_path, "routes.txt"))
@@ -311,6 +311,8 @@ async def view(interaction: discord.Interaction, stop_name: str):
     await interaction.response.defer()
 
     url = "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates"
+    # url = "https://gtfsrt.api.translink.com.au/api/realtime/CNS/TripUpdates"
+
     feed = gtfs_realtime_pb2.FeedMessage()
     try:
         async with aiohttp.ClientSession() as session:

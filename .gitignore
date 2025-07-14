@@ -1,3 +1,4 @@
 .env
-gtfs_static
+SEQ_GTFS
 .DS_Store
+users
