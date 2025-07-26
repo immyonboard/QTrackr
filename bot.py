@@ -88,25 +88,45 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 def resolve_stop_input(user_input: str):
-    """Resolves user input (stop ID, exact name, or partial name) to a stop ID and name."""
+    """Resolves user input to a stop name and a list of relevant stop IDs."""
+    # Standardize input
+    user_input_lower = user_input.strip().lower()
+
+    # --- Match Finding ---
     # 1. Exact match for stop_id
-    exact_id = stops[stops["stop_id"] == user_input]
-    if not exact_id.empty:
-        return exact_id.iloc[0]["stop_id"], exact_id.iloc[0]["stop_name"]
-
+    match = stops[stops["stop_id"] == user_input]
     # 2. Exact match for stop_name (case-insensitive)
-    exact_name = stops[stops["stop_name"].str.lower() == user_input.lower()]
-    if not exact_name.empty:
-        return exact_name.iloc[0]["stop_id"], exact_name.iloc[0]["stop_name"]
+    if match.empty:
+        match = stops[stops["stop_name"].str.lower() == user_input_lower]
+    # 3. Fuzzy match for stop_name
+    if match.empty:
+        fuzzy_matches = stops[stops["stop_name"].str.contains(user_input, case=False, na=False)]
+        if not fuzzy_matches.empty:
+            # Prefer matches that start with the input, then sort by length
+            fuzzy_matches['startswith'] = fuzzy_matches['stop_name'].str.lower().str.startswith(user_input_lower)
+            fuzzy_matches['length'] = fuzzy_matches['stop_name'].str.len()
+            fuzzy_matches = fuzzy_matches.sort_values(['startswith', 'length'], ascending=[False, True])
+            match = fuzzy_matches.head(1)
 
-    # 3. Fuzzy match for stop_name, preferring shorter, more specific matches
-    fuzzy_matches = stops[stops["stop_name"].str.contains(user_input, case=False, na=False)]
-    if not fuzzy_matches.empty:
-        fuzzy_matches["length"] = fuzzy_matches["stop_name"].str.len()
-        best_match = fuzzy_matches.sort_values("length").iloc[0]
-        return best_match["stop_id"], best_match["stop_name"]
+    if match.empty:
+        return None, None, None
 
-    return None, None
+    # --- Stop Resolution ---
+    stop_info = match.iloc[0]
+    stop_id = stop_info["stop_id"]
+    stop_name = stop_info["stop_name"]
+
+    # Check if the matched stop is a parent station (location_type '1')
+    # Or if it acts as a parent (its ID is in the 'parent_station' column of other stops)
+    is_station = 'location_type' in stop_info and stop_info['location_type'] == '1'
+    child_stops = stops[stops["parent_station"] == stop_id]
+
+    if not child_stops.empty:
+        # It's a parent station, return all child stop IDs
+        return stop_name, child_stops["stop_id"].tolist(), True
+    else:
+        # It's a single stop/platform
+        return stop_name, [stop_id], False
 
 async def stop_autocomplete(interaction: discord.Interaction, current: str):
     """Provides autocomplete suggestions for stop names, prioritizing pinned stops."""
@@ -191,22 +211,27 @@ async def pin(interaction: discord.Interaction, stop_name: str):
     pid_mode="The display mode for the departures. 'General', 'Rail', 'Bus', or 'Tram'."
 )
 async def view(interaction: discord.Interaction, stop_name: str, service_count: int = 8, pid_mode: str = "General"):
-    """Fetches and displays real-time and scheduled departures for a stop."""
+    """Fetches and displays real-time and scheduled departures for a stop or station."""
     await interaction.response.defer(thinking=True, ephemeral=False)
 
-    # Resolve stop name and get next services
-    stop_id, stop_real_name = resolve_stop_input(stop_name)
-    if not stop_id:
-        await interaction.followup.send(f"Could not find stop: {stop_name}", ephemeral=True)
+    # Resolve stop name to get a list of stop IDs
+    stop_real_name, stop_ids, is_station = resolve_stop_input(stop_name)
+    if not stop_ids:
+        await interaction.followup.send(f"Could not find stop or station: '{stop_name}'", ephemeral=True)
         return
-    if service_count == 8:
+
+    # Auto-adjust service count for specific PID modes if not user-set
+    if service_count == 8: # Default value
         if pid_mode.lower() == "rail":
             service_count = 6
         elif pid_mode.lower() == "bus":
             service_count = 7
         elif pid_mode.lower() == "bus-led":
             service_count = 5
-    upcoming_services, _ = await track.get_next_services(stop_id, service_count)
+
+    # Fetch services for all resolved stop IDs
+    upcoming_services, _ = await track.get_next_services(stop_ids, service_count)
+
     if not upcoming_services:
         embed = discord.Embed(
             title=f"No upcoming departures at {stop_real_name}",
@@ -223,39 +248,52 @@ async def view(interaction: discord.Interaction, stop_name: str, service_count: 
     pid_mode_lower = pid_mode.lower()
 
     if pid_mode_lower == "general":
-        header = f"ID   {'Route':<27}Time  RT"
+        header = f"ID   {'Destination':<27}Time  RT"
         for service in upcoming_services:
             ansi_code = closest_ansi_color(service.get('route_color', 'FFFFFF'))
             time_diff_minutes = int((service['eta_time'] - now).total_seconds() // 60)
             eta_diff_str = "Now" if time_diff_minutes < 1 else f"{time_diff_minutes} min"
             rt_marker = " ●" if service['is_realtime'] else " ○"
-            colored_dest = f"\x1b[{ansi_code}m{service['destination'][:25]:<26}\x1b[0m"
+            
+            plat = service.get('platform', '-')
+            dest = service['destination']
+            display_dest = f"({plat}) {dest}" if plat != '-' else dest
+
+            colored_dest = f"\x1b[{ansi_code}m{display_dest[:25]:<26}\x1b[0m"
             route_id_str = f"{service['route_name']:<5}"
             time_str = f"{eta_diff_str:>6}"
             rows.append(f"{route_id_str}{colored_dest}{time_str} {rt_marker}")
 
     elif pid_mode_lower == "rail":
         header = f"\x1b[33;1m{now.strftime('%I:%M')}\x1b[33;0m          Next services"
-
-        rows.append(f"\x1b[0;37;1mˆService{'':<20}Platform Departs\x1b[0m")
-        # header = f"Time  Destination{'':<20}Plat  ETA"
+        rows.append(f"\x1b[0;37;1m Service{'':<21}Platform  Departs\x1b[0m")
         for service in upcoming_services:
             ansi_code = closest_ansi_color(service.get('route_color', 'FFFFFF'))
             eta_time = service['eta_time'].strftime('%H:%M')
-            destination = service['destination'].replace(' station', '').replace('Station', '')[:21]
-            colored_dest = f"\x1b[{ansi_code}m{destination:<21}\x1b[0m"
-            plat = service.get('platform', ' - ')
+            
+            plat = service.get('platform', '-')
+            dest = service['destination'].replace(' station', '').replace('Station', '')
+            
+            # Truncate and pad the destination string to a fixed width
+            dest_str = f"{dest[:21]:<22}"
+            colored_dest = f"\x1b[{ansi_code}m{dest_str}\x1b[0m"
+
+            platform_str = f"{plat:^8}"
             time_diff_minutes = int((service['eta_time'] - now).total_seconds() // 60)
             eta_diff_str = "Now" if time_diff_minutes < 1 else f"{time_diff_minutes} min"
-            rows.append(f"{eta_time}  {colored_dest} {plat:<6}  {eta_diff_str:>6}")
+            rows.append(f" {eta_time:<5} {colored_dest} {platform_str} {eta_diff_str:>6}")
 
     elif pid_mode_lower == "bus":
         header = f"Route  Destination{'':<20}Departs"
         for service in upcoming_services:
             ansi_code = closest_ansi_color(service.get('route_color', 'FFFFFF'))
             route_name = service['route_name']
-            destination = service['destination'][:31]
-            colored_dest = f"\x1b[{ansi_code}m{destination:<32}\x1b[0m"
+            
+            plat = service.get('platform', '-')
+            dest = service['destination']
+            display_dest = dest
+
+            colored_dest = f"\x1b[{ansi_code}m{display_dest[:31]:<32}\x1b[0m"
             time_diff_minutes = int((service['eta_time'] - now).total_seconds() // 60)
             eta_diff_str = "Now" if time_diff_minutes < 1 else f"{time_diff_minutes} min"
             rows.append(f"{route_name:<6} {colored_dest} {eta_diff_str:>6}")
@@ -265,8 +303,12 @@ async def view(interaction: discord.Interaction, stop_name: str, service_count: 
         header = f""
         for service in upcoming_services:
             ansi_code = closest_ansi_color(service.get('route_color', 'ffd700'))
-            destination = service['destination'][:28]
-            colored_dest = f"\x1b[{ansi_code}m{destination:<28}\x1b[0m"
+            
+            plat = service.get('platform', '-')
+            dest = service['destination']
+            display_dest = f"({plat}) {dest}" if plat != '-' else dest
+
+            colored_dest = f"\x1b[{ansi_code}m{display_dest[:28]:<28}\x1b[0m"
             time_diff_minutes = int((service['eta_time'] - now).total_seconds() // 60)
             eta_diff_str = "Now" if time_diff_minutes < 1 else f"{time_diff_minutes} min"
             rows.append(f"{colored_dest} {eta_diff_str:>6}")

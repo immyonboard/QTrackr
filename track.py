@@ -4,6 +4,7 @@ import aiohttp
 from datetime import datetime, timezone, timedelta
 from google.transit import gtfs_realtime_pb2
 import asyncio
+import re
 
 # --- Config ---
 GTFS_DIR = "SEQ_GTFS"
@@ -56,8 +57,8 @@ def get_service_ids_for_day(date_obj):
 
     return service_ids
 
-def get_scheduled_departures(stop_id, now_local):
-    """Gets scheduled departures for a given stop."""
+def get_scheduled_departures(stop_ids, now_local):
+    """Gets scheduled departures for a given list of stop IDs."""
     today = now_local.date()
     yesterday = today - timedelta(days=1)
 
@@ -67,7 +68,8 @@ def get_scheduled_departures(stop_id, now_local):
     trips_today = trips[trips['service_id'].isin(service_ids_today)]
     trips_yesterday = trips[trips['service_id'].isin(service_ids_yesterday)]
 
-    stop_services = stop_times[stop_times['stop_id'] == stop_id]
+    # Filter stop_times for all stop_ids in the provided list
+    stop_services = stop_times[stop_times['stop_id'].isin(stop_ids)]
 
     def parse_arrival(time_str, day_start):
         try:
@@ -88,31 +90,49 @@ def get_scheduled_departures(stop_id, now_local):
     all_services = pd.concat([services_yesterday_df, services_today_df])
     all_services.dropna(subset=['arrival_dt'], inplace=True)
     future_services = all_services[all_services['arrival_dt'] >= now_local].copy()
-    merged = future_services.merge(routes, on='route_id')
-    return merged
 
-async def get_next_services(stop_id: str, service_count: int = 8):
-    """Fetches and merges scheduled and real-time data for a specified number of services."""
-    # Since we are passing the ID directly, we don't need to resolve it again.
-    # We'll fetch the stop_name from the stops DataFrame for the response.
-    stop_info = stops[stops['stop_id'] == stop_id]
-    if stop_info.empty:
-        return None, f"Stop ID '{stop_id}' not found."
-    stop_real_name = stop_info.iloc[0]['stop_name']
+    merged = future_services.merge(routes, on='route_id')
+    merged_with_stops = merged.merge(stops[['stop_id', 'stop_name']], on='stop_id')
+    
+    # Extract platform number or letter from stop_name
+    def get_platform(name):
+        # Regex to find 'Platform X', 'Stop Y', or a number at the end of the string
+        match = re.search(r'(?:Platform|Stop)\s*(\w+)|(\d+)$', name)
+        if match:
+            # Return the first non-None group from the match
+            return next((g for g in match.groups() if g is not None), '-')
+        return '-'
+
+    merged_with_stops['platform'] = merged_with_stops['stop_name'].apply(get_platform)
+    
+    return merged_with_stops
+
+async def get_next_services(stop_ids: list[str], service_count: int = 8):
+    """Fetches and merges scheduled and real-time data for a list of stop IDs."""
+    if not stop_ids:
+        return None, "No stop IDs provided."
+
+    # The stop_real_name is now resolved in the bot, so we don't need to do it here.
+    # We can use the first stop_id to get a name for logging if needed, but the primary display name is handled by the caller.
+    stop_info = stops[stops['stop_id'] == stop_ids[0]]
+    stop_real_name = stop_info.iloc[0]['stop_name'] if not stop_info.empty else "Unknown Stop"
 
     now_local = datetime.now().astimezone()
 
-    # 1. Get scheduled departures
-    scheduled_df = get_scheduled_departures(stop_id, now_local)
+    # 1. Get scheduled departures for all stop_ids
+    scheduled_df = get_scheduled_departures(stop_ids, now_local)
     scheduled_services = {}
     for _, row in scheduled_df.iterrows():
-        scheduled_services[row['trip_id']] = {
+        # Use a unique key combining trip_id and stop_id to handle the same trip across multiple platforms
+        service_key = f"{row['trip_id']}-{row['stop_id']}"
+        scheduled_services[service_key] = {
             'scheduled_time': row['arrival_dt'],
-            'eta_time': row['arrival_dt'],  # Initially, ETA is the scheduled time
+            'eta_time': row['arrival_dt'],
             'route_name': row['route_short_name'],
             'destination': row['trip_headsign'],
             'is_realtime': False,
-            'route_color': row.get('route_color', 'FFFFFF') # Add route_color
+            'route_color': row.get('route_color', 'FFFFFF'),
+            'platform': row.get('platform', '-') # Get platform info
         }
 
     # 2. Get and merge real-time data
@@ -120,7 +140,7 @@ async def get_next_services(stop_id: str, service_count: int = 8):
     feed = gtfs_realtime_pb2.FeedMessage()
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=5) as resp:
+            async with session.get(url, timeout=10) as resp:
                 data = await resp.read()
                 feed.ParseFromString(data)
     except Exception as e:
@@ -130,17 +150,19 @@ async def get_next_services(stop_id: str, service_count: int = 8):
     for entity in feed.entity:
         if entity.HasField('trip_update'):
             trip_id = entity.trip_update.trip.trip_id
-            if trip_id in scheduled_services:
-                for stu in entity.trip_update.stop_time_update:
-                    if stu.stop_id == stop_id:
-                        arrival_ts = stu.arrival.time if stu.HasField('arrival') else stu.departure.time
-                        if arrival_ts:
-                            arrival_dt_utc = datetime.fromtimestamp(arrival_ts, timezone.utc)
-                            if arrival_dt_utc >= now_utc:
-                                scheduled_services[trip_id]['eta_time'] = arrival_dt_utc.astimezone(now_local.tzinfo)
-                                scheduled_services[trip_id]['is_realtime'] = True
+            for stu in entity.trip_update.stop_time_update:
+                service_key = f"{trip_id}-{stu.stop_id}"
+                if service_key in scheduled_services:
+                    arrival_ts = stu.arrival.time if stu.HasField('arrival') else stu.departure.time
+                    if arrival_ts:
+                        arrival_dt_utc = datetime.fromtimestamp(arrival_ts, timezone.utc)
+                        if arrival_dt_utc >= now_utc:
+                            scheduled_services[service_key]['eta_time'] = arrival_dt_utc.astimezone(now_local.tzinfo)
+                            scheduled_services[service_key]['is_realtime'] = True
 
     # 4. Prepare for display
+    # Since a trip might appear multiple times if it stops at multiple platforms in the list,
+    # we need to decide how to handle it. For now, we'll just combine and sort them.
     upcoming = sorted(list(scheduled_services.values()), key=lambda x: x['eta_time'])
     return upcoming[:service_count], stop_real_name
 
