@@ -138,13 +138,18 @@ async def get_next_services(stop_ids: list[str], service_count: int = 8):
     # 2. Get and merge real-time data
     url = "https://gtfsrt.api.translink.com.au/api/realtime/SEQ/TripUpdates"
     feed = gtfs_realtime_pb2.FeedMessage()
+    updates_found = 0
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=10) as resp:
-                data = await resp.read()
-                feed.ParseFromString(data)
+                if resp.status == 200:
+                    data = await resp.read()
+                    feed.ParseFromString(data)
+                    print(f"Successfully fetched and parsed real-time data. {len(feed.entity)} entities found.")
+                else:
+                    print(f"Failed to fetch real-time data. Status: {resp.status}")
     except Exception as e:
-        print(f"Could not fetch real-time data: {e}")
+        print(f"Could not fetch or parse real-time data: {e}")
 
     now_utc = datetime.now(timezone.utc)
     for entity in feed.entity:
@@ -159,6 +164,9 @@ async def get_next_services(stop_ids: list[str], service_count: int = 8):
                         if arrival_dt_utc >= now_utc:
                             scheduled_services[service_key]['eta_time'] = arrival_dt_utc.astimezone(now_local.tzinfo)
                             scheduled_services[service_key]['is_realtime'] = True
+                            updates_found += 1
+    
+    print(f"Matched {updates_found} real-time updates to scheduled services.")
 
     # 4. Prepare for display
     # Since a trip might appear multiple times if it stops at multiple platforms in the list,
