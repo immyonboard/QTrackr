@@ -89,18 +89,21 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 def resolve_stop_input(user_input: str):
     """Resolves user input to a stop name and a list of relevant stop IDs."""
-    # Standardize input
-    user_input_lower = user_input.strip().lower()
+    # Standardize input and strip common suffixes
+    cleaned_user_input = user_input.strip()
+    if cleaned_user_input.lower().endswith(' station'):
+        cleaned_user_input = cleaned_user_input[:-8].strip()
+    user_input_lower = cleaned_user_input.lower()
 
     # --- Match Finding ---
     # 1. Exact match for stop_id
-    match = stops[stops["stop_id"] == user_input]
+    match = stops[stops["stop_id"] == cleaned_user_input]
     # 2. Exact match for stop_name (case-insensitive)
     if match.empty:
         match = stops[stops["stop_name"].str.lower() == user_input_lower]
     # 3. Fuzzy match for stop_name
     if match.empty:
-        fuzzy_matches = stops[stops["stop_name"].str.contains(user_input, case=False, na=False)]
+        fuzzy_matches = stops[stops["stop_name"].str.contains(cleaned_user_input, case=False, na=False)]
         if not fuzzy_matches.empty:
             # Prefer matches that start with the input, then sort by length
             fuzzy_matches['startswith'] = fuzzy_matches['stop_name'].str.lower().str.startswith(user_input_lower)
@@ -118,14 +121,14 @@ def resolve_stop_input(user_input: str):
 
     # Check if the matched stop is a parent station (location_type '1')
     # Or if it acts as a parent (its ID is in the 'parent_station' column of other stops)
-    is_station = 'location_type' in stop_info and stop_info['location_type'] == '1'
-    child_stops = stops[stops["parent_station"] == stop_id]
+    # The most reliable way to handle parent stations is to directly look for child stops.
+    child_stops = stops[stops['parent_station'] == stop_id]
 
     if not child_stops.empty:
-        # It's a parent station, return all child stop IDs
-        return stop_name, child_stops["stop_id"].tolist(), True
+        # This is a parent station. Return the list of its child platform IDs.
+        return stop_name, child_stops['stop_id'].tolist(), True
     else:
-        # It's a single stop/platform
+        # This is a single platform or a parent with no listed children. Use its own ID.
         return stop_name, [stop_id], False
 
 async def stop_autocomplete(interaction: discord.Interaction, current: str):
@@ -215,7 +218,9 @@ async def view(interaction: discord.Interaction, stop_name: str, service_count: 
     await interaction.response.defer(thinking=True, ephemeral=False)
 
     # Resolve stop name to get a list of stop IDs
-    stop_real_name, stop_ids, is_station = resolve_stop_input(stop_name)
+    stop_name_input = stop_name
+    stop_name, stop_ids, is_station = resolve_stop_input(stop_name_input)
+    print(f"Resolved '{stop_name_input}' to stop_name: '{stop_name}', stop_ids: {stop_ids}, is_station: {is_station}")
     if not stop_ids:
         await interaction.followup.send(f"Could not find stop or station: '{stop_name}'", ephemeral=True)
         return
@@ -234,9 +239,9 @@ async def view(interaction: discord.Interaction, stop_name: str, service_count: 
 
     if not upcoming_services:
         embed = discord.Embed(
-            title=f"No upcoming departures at {stop_real_name}",
+            title=f"No upcoming departures at {stop_name}",
             description="There are no services scheduled for this stop at this time.",
-            color=discord.Color.red()
+            color=discord.Color.orange()
         )
         await interaction.followup.send(embed=embed)
         return
@@ -335,7 +340,7 @@ async def view(interaction: discord.Interaction, stop_name: str, service_count: 
 
     # Create and send embed
     embed = discord.Embed(
-        title=f"Next Departures at {stop_real_name}",
+        title=f"Next Departures at {stop_name}",
         color=embed_color
     )
     embed.description = f"```ansi\n{header}\n" + "\n".join(rows) + "\n```"
